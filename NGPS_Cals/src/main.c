@@ -12,7 +12,7 @@
 //
 // Examples:
 //   ./ngps_cals_status --dir /data/latest
-//   ./ngps_cals_status --dir /data/latest --csv ngps_20260128.csv --night 20260128
+//   ./ngps_cals_status --dir /data/latest --csv ngps_20260128.csv  20260128
 //   ./ngps_cals_status --dir /data/latest --csv ngps_20260128.csv --debug --once
 //   ./ngps_cals_status --gui --dir /data/latest --csv ngps_20260128.csv
 
@@ -1053,15 +1053,9 @@ static void render_dashboard(
 
     time_t now=time(NULL);
     struct tm lt; localtime_r(&now,&lt);
-    char tbuf[64]; strftime(tbuf,sizeof(tbuf),"%Y-%m-%d %H:%M:%S %Z",&lt);
-
-    char nbuf[16];
-    if(night_id>0) fmt_date_yyyymmdd(night_id, nbuf);
-    else snprintf(nbuf,sizeof(nbuf),"(none)");
-
-    printf("NGPS calibration status (multi-ext)  %s\n", tbuf);
+    char tbuf[64]; strftime(tbuf,sizeof(tbuf),"%Y-%m-%d %H:%M:%S %Z",&lt);    printf("NGPS calibration status (multi-ext)  %s\n", tbuf);
     printf("Directory: %s\n", dirPath);
-    printf("Night label: %s   (files scanned: %d, matched night: %d)\n", nbuf, nscan, nmatch);
+    printf("Files scanned: %d, FITS ok: %d\n", nscan, nmatch);
     printf("Requirements per setup & per channel: THAR=%d FEAR=%d BIAS=%d DOMEFLAT=%d\n", REQ_THAR, REQ_FEAR, REQ_BIAS, REQ_DOMEFLAT);
     printf("U/G cal counts only include cal frames where R & I detectors are OFF (R.DBias<=0 AND I.DBias<=0).\n");
     printf("Cal frames are counted only if IMGTYPE is one of: FEAR, THAR, DOMEFLAT, DARK, BIAS, CONT. Science frames only if IMGTYPE==SCI.\n");
@@ -1264,9 +1258,7 @@ typedef struct {
 static void usage(const char *argv0){
     printf("Usage: %s [options]\n\n", argv0);
     printf("Options:\n");
-    printf("  --dir PATH              Directory to scan (default: /data/latest)\n");
-    printf("  --night YYYYMMDD         Night label (local). If omitted, auto-picks mode night in dir\n");
-    printf("  --csv FILE.csv           Observing plan CSV with BINSPAT,(BINSPEC|BINSPECT)[,SLITW|SLITWIDTH]\n");
+    printf("  --dir PATH              Directory to scan (default: /data/latest)\n");    printf("  --csv FILE.csv           Observing plan CSV with BINSPAT,(BINSPEC|BINSPECT)[,SLITW|SLITWIDTH]\n");
     printf("  --refresh N              Refresh every N seconds (default: 5)\n");
     printf("  --once                   Print once and exit\n");
     printf("  --slit-tol X             Slit match tolerance in arcsec (default: 0.05)\n");
@@ -1295,8 +1287,7 @@ static Options parse_args(int argc, char **argv){
     for(int i=1;i<argc;i++){
         const char *a=argv[i];
         if(strcmp(a,"--dir")==0 && i+1<argc){ o.dirPath=argv[++i]; continue; }
-        if(strcmp(a,"--csv")==0 && i+1<argc){ o.csvPath=argv[++i]; continue; }
-        if(strcmp(a,"--night")==0 && i+1<argc){ o.night_id=atoi(argv[++i]); continue; }
+        if(strcmp(a,"--csv")==0 && i+1<argc){ o.csvPath=argv[++i]; continue; }        if(strcmp(a,"")==0 && i+1<argc){ (void)argv[++i]; /* deprecated: ignored */ continue; }
         if(strcmp(a,"--refresh")==0 && i+1<argc){ o.refresh_sec=atoi(argv[++i]); continue; }
         if(strcmp(a,"--once")==0){ o.once=true; continue; }
         if(strcmp(a,"--slit-tol")==0 && i+1<argc){ o.slit_tol=atof(argv[++i]); continue; }
@@ -1472,16 +1463,9 @@ static void compute_once_params(
     SuppressStats *supp_out,
     CsvStats *csvStats_out
 ){
-    // night selection
-    int night_id = night_id_in;
-    NightVec nights={0};
-    if(night_id==0){
-        scan_dir_collect_nights(dirPath, &nights);
-        night_id = nightvec_pick_mode(&nights);
-    }
-
-    if(night_id_out) *night_id_out = night_id;
-    nightvec_free(&nights);
+    // night filtering disabled: consider all .fits in dir as relevant
+    int night_id = 0;
+    if(night_id_out) *night_id_out = 0;
 
     // CSV requirements
     bool csv_ok=false;
@@ -1557,12 +1541,7 @@ static void render_dashboard_html(
     int nmatch,
     const SuppressStats *supp,
     int refresh_sec
-){
-    char night_str[32]={0};
-    if(night_id>0) fmt_date_yyyymmdd(night_id, night_str);
-    else night_str[0]=0;
-
-    fputs(
+){    fputs(
         "<!doctype html><html><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
         "<title>NGPS Cals Status</title>"
@@ -1591,15 +1570,13 @@ static void render_dashboard_html(
     , out);
 
     fprintf(out,"<h1>NGPS calibration status</h1>");
-    fprintf(out,"<div class=\"sub\">files scanned: %d, matched night: %d &nbsp;|&nbsp; slit tol %.2f&quot; &nbsp;|&nbsp; req: THAR=%d FEAR=%d BIAS=%d DOMEFLAT=%d</div>",
+    fprintf(out,"<div class=\"sub\">files scanned: %d, FITS ok: %d &nbsp;|&nbsp; slit tol %.2f&quot; &nbsp;|&nbsp; req: THAR=%d FEAR=%d BIAS=%d DOMEFLAT=%d</div>",
             nscan, nmatch, slit_tol, REQ_THAR, REQ_FEAR, REQ_BIAS, REQ_DOMEFLAT);
 
-    // form (dir/csv/night/refresh)
+    // form (dir/csv/refresh)
     fprintf(out,"<form method=\"GET\" action=\"/\">");
     fprintf(out,"<label>Data dir<input name=\"dir\" value=\""); html_escape_fputs(out, dirPath?dirPath:""); fprintf(out,"\"></label>");
-    fprintf(out,"<label>CSV<input name=\"csv\" value=\""); html_escape_fputs(out, csvPath?csvPath:""); fprintf(out,"\"></label>");
-    fprintf(out,"<label>Night (YYYYMMDD)<input class=\"small\" name=\"night\" value=\""); html_escape_fputs(out, night_str); fprintf(out,"\"></label>");
-    fprintf(out,"<label>Refresh (s)<input class=\"small\" name=\"refresh\" value=\"%d\"></label>", refresh_sec);
+    fprintf(out,"<label>CSV<input name=\"csv\" value=\""); html_escape_fputs(out, csvPath?csvPath:""); fprintf(out,"\"></label>");    fprintf(out,"<label>Refresh (s)<input class=\"small\" name=\"refresh\" value=\"%d\"></label>", refresh_sec);
     fprintf(out,"<button type=\"submit\">Update</button>");
     fprintf(out,"</form>");
 
@@ -1763,7 +1740,7 @@ static void handle_http_client(int cfd, const Options *opt){
     if(qmark){ *qmark=0; query = qmark+1; }
 
     // params with defaults
-    char dir[2048]={0}, csv[2048]={0}, night[64]={0}, refresh[32]={0};
+    char dir[2048]={0}, csv[2048]={0}, refresh[32]={0};
     snprintf(dir,sizeof(dir),"%s", opt->dirPath?opt->dirPath:"");
     if(opt->csvPath) snprintf(csv,sizeof(csv),"%s", opt->csvPath);
 
@@ -1771,11 +1748,8 @@ static void handle_http_client(int cfd, const Options *opt){
         char tmp[2048];
         if(query_get_value(query,"dir",tmp,sizeof(tmp))) snprintf(dir,sizeof(dir),"%s", tmp);
         if(query_get_value(query,"csv",tmp,sizeof(tmp))) snprintf(csv,sizeof(csv),"%s", tmp);
-        if(query_get_value(query,"night",tmp,sizeof(tmp))) snprintf(night,sizeof(night),"%s", tmp);
         if(query_get_value(query,"refresh",tmp,sizeof(tmp))) snprintf(refresh,sizeof(refresh),"%s", tmp);
-    }
-
-    int night_id = (night[0] ? atoi(night) : opt->night_id);
+    }    int night_id = 0; // night filtering disabled
     int refresh_sec = (refresh[0] ? atoi(refresh) : opt->refresh_sec);
     if(refresh_sec < 0) refresh_sec = 0;
 
@@ -1851,12 +1825,8 @@ int main(int argc, char **argv){
         return run_gui_server(&opt);
     }
 
-    // Auto-pick night if needed
-    NightVec nights={0};
-    if(opt.night_id==0){
-        scan_dir_collect_nights(opt.dirPath, &nights);
-        opt.night_id = nightvec_pick_mode(&nights);
-    }
+    // Night filtering disabled: all .fits in the directory are considered part of the same observing set
+    opt.night_id = 0;
 
     // Read requirements from CSV (if given)
     BinVec reqBins={0};
@@ -1935,7 +1905,6 @@ render_dashboard(opt.dirPath, opt.night_id, opt.csvPath, csv_ok, inferred_from_s
     }
 
     term_restore();
-    nightvec_free(&nights);
     binvec_free(&reqBins);
     flatvec_free(&reqFlats);
     return 0;
