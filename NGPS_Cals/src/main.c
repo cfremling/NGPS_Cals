@@ -917,7 +917,7 @@ static void scan_dir_counts(
             // CAL handling: apply DBIAS gating and U/G R&I-off requirement
             if(!cm->det_on) continue;
 
-            bool need_ri_off = (ch==CH_U || ch==CH_G);
+            bool need_ri_off = false;
             if(need_ri_off && !ri_off){
                 if(supp){
                     if(ch==CH_U) supp->ug_suppressed[0]++;
