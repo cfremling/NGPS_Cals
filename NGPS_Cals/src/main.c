@@ -1,21 +1,21 @@
-// ngps_cals_status_v3.c
+// ngps_cals_status_v5.c
 // Terminal status dashboard for NGPS calibration completeness (multi-extension NGPS FITS).
 //
-// v3 updates (Jan 2026):
-//  - Robust CSV parsing (handles empty fields ",,", quoted fields, and BINSPECT column name)
-//  - Science counting: treat any non-cal IMGTYPE as SCI, and DO NOT apply DBIAS gating to SCI
-//  - DBIAS gating applies ONLY to calibrations (THAR/FEAR/BIAS/DOMEFLAT)
-//  - U/G calibration validity requires R & I detectors OFF (per-extension DBIAS)
-//  - If requirements from --csv (or SCI inference) are empty, fall back to displaying detected setups
-//  - Adds --debug to print diagnostics about CSV ingestion and scan grouping
+// v5 updates (Jan 2026):
+//  - ANSI red/green completion highlighting in terminal tables (no change to counting logic)
+//  - Optional --gui: lightweight local web UI with compact tables and editable dir/csv/night fields
+//  - Table printer aligns correctly even with ANSI color codes
+//  - Underlying scan/count/group logic unchanged from v4
 //
 // Build:
-//   gcc -O2 -Wall -Wextra -std=c11 -o ngps_cals_status ngps_cals_status_v3.c -lm
+//   gcc -O2 -Wall -Wextra -std=c11 -o ngps_cals_status ngps_cals_status_v5.c -lm
 //
 // Examples:
 //   ./ngps_cals_status --dir /data/latest
 //   ./ngps_cals_status --dir /data/latest --csv ngps_20260128.csv --night 20260128
 //   ./ngps_cals_status --dir /data/latest --csv ngps_20260128.csv --debug --once
+//   ./ngps_cals_status --gui --dir /data/latest --csv ngps_20260128.csv
+
 
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -32,6 +32,9 @@
 #include <unistd.h>
 #include <sys/select.h>
 #include <termios.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 // ------------------------------
 // Requirements
@@ -969,10 +972,26 @@ static void table_border(const int *w, int ncols, char ch){
     putchar('\n');
 }
 
+
+static int visible_len_ansi(const char *s){
+    // Count printable characters, ignoring ANSI SGR sequences like "\033[31m".
+    int n=0;
+    for(size_t i=0; s && s[i]; ){
+        if(s[i]=='\033' && s[i+1]=='['){
+            i+=2;
+            while(s[i] && s[i] != 'm') i++;
+            if(s[i]=='m') i++;
+        } else {
+            n++; i++;
+        }
+    }
+    return n;
+}
+
 static void table_row(const int *w, const bool *right, const char **cells, int ncols){
     putchar('|');
     for(int i=0;i<ncols;i++){
-        int len = (int)strlen(cells[i]);
+        int len = visible_len_ansi(cells[i]);
         int pad = w[i] - len;
         if(pad < 0) pad = 0;
 
@@ -995,6 +1014,22 @@ static void fmt_ratio(char *buf, size_t n, int have, int req){
     else snprintf(buf, n, "%d", have);
 }
 
+static void fmt_ratio_col(char *buf, size_t n, int have, int req, bool tty){
+    char tmp[32];
+    fmt_ratio(tmp, sizeof(tmp), have, req);
+    if(!tty || req<=0){
+        snprintf(buf, n, "%s", tmp);
+        return;
+    }
+    const char *c = (have>=req) ? C_GREEN : C_RED;
+    snprintf(buf, n, "%s%s%s", c, tmp, C_RESET);
+}
+
+static void fmt_ch_col(char *buf, size_t n, const char *ch, bool ok, bool tty){
+    if(!tty){ snprintf(buf, n, "%s", ch); return; }
+    snprintf(buf, n, "%s%s%s", ok?C_GREEN:C_RED, ch, C_RESET);
+}
+
 static void render_dashboard(
     const char *dirPath,
     int night_id,
@@ -1013,6 +1048,8 @@ static void render_dashboard(
     bool do_clear
 ){
     if(do_clear) clear_screen();
+
+    bool tty = is_tty_stdout();
 
     time_t now=time(NULL);
     struct tm lt; localtime_r(&now,&lt);
@@ -1090,16 +1127,16 @@ static void render_dashboard(
                 if(ch==0) snprintf(rows[ridx].c[0], sizeof(rows[ridx].c[0]), "%dx%d", bs, bc);
                 else      rows[ridx].c[0][0]=0;
 
-                snprintf(rows[ridx].c[1], sizeof(rows[ridx].c[1]), "%s", CH_NAME[ch]);
-                fmt_ratio(rows[ridx].c[2], sizeof(rows[ridx].c[2]), have_thar, REQ_THAR);
+                fmt_ch_col(rows[ridx].c[1], sizeof(rows[ridx].c[1]), CH_NAME[ch], ok, tty);
+                fmt_ratio_col(rows[ridx].c[2], sizeof(rows[ridx].c[2]), have_thar, REQ_THAR, tty);
                 snprintf(rows[ridx].c[3], sizeof(rows[ridx].c[3]), "%d", good_thar);
-                fmt_ratio(rows[ridx].c[4], sizeof(rows[ridx].c[4]), have_fear, REQ_FEAR);
+                fmt_ratio_col(rows[ridx].c[4], sizeof(rows[ridx].c[4]), have_fear, REQ_FEAR, tty);
                 snprintf(rows[ridx].c[5], sizeof(rows[ridx].c[5]), "%d", good_fear);
-                fmt_ratio(rows[ridx].c[6], sizeof(rows[ridx].c[6]), have_bias, REQ_BIAS);
+                fmt_ratio_col(rows[ridx].c[6], sizeof(rows[ridx].c[6]), have_bias, REQ_BIAS, tty);
                 snprintf(rows[ridx].c[7], sizeof(rows[ridx].c[7]), "%d", have_sci);
 
                 for(int k=0;k<NC_ARC;k++){
-                    int L=(int)strlen(rows[ridx].c[k]);
+                    int L=visible_len_ansi(rows[ridx].c[k]);
                     if(L>w[k]) w[k]=L;
                 }
                 ridx++;
@@ -1161,16 +1198,17 @@ static void render_dashboard(
             for(int ch=0; ch<CH_N; ch++){
                 int have_flat=0;
                 if(fi>=0) have_flat = foundFlats->v[fi].domeflat[ch];
-                if(have_flat>=REQ_DOMEFLAT) complete_by_ch_flats[ch]++;
+                bool ok = (have_flat>=REQ_DOMEFLAT);
+                if(ok) complete_by_ch_flats[ch]++;
 
                 if(ch==0) snprintf(rows[ridx].c[0], sizeof(rows[ridx].c[0]), "%dx%d slit %.2f\"", bs, bc, sw);
                 else      rows[ridx].c[0][0]=0;
 
-                snprintf(rows[ridx].c[1], sizeof(rows[ridx].c[1]), "%s", CH_NAME[ch]);
-                fmt_ratio(rows[ridx].c[2], sizeof(rows[ridx].c[2]), have_flat, REQ_DOMEFLAT);
+                fmt_ch_col(rows[ridx].c[1], sizeof(rows[ridx].c[1]), CH_NAME[ch], ok, tty);
+                fmt_ratio_col(rows[ridx].c[2], sizeof(rows[ridx].c[2]), have_flat, REQ_DOMEFLAT, tty);
 
                 for(int k=0;k<NC_FLAT;k++){
-                    int L=(int)strlen(rows[ridx].c[k]);
+                    int L=visible_len_ansi(rows[ridx].c[k]);
                     if(L>w[k]) w[k]=L;
                 }
                 ridx++;
@@ -1219,6 +1257,8 @@ typedef struct {
     double default_slitw;
     bool infer_from_sci_if_no_csv;
     bool debug;
+    bool gui;
+    int gui_port;
 } Options;
 
 static void usage(const char *argv0){
@@ -1233,6 +1273,8 @@ static void usage(const char *argv0){
     printf("  --default-slit X         If CSV has no slit column, assume this slit (default: 1.50)\n");
     printf("  --no-infer-sci           If no CSV (or CSV fails), do not infer required setups from SCI frames\n");
     printf("  --debug                  Print debug diagnostics (CSV columns, row parsing, scan stats)\n");
+    printf("  --gui                    Launch a local web UI (compact tables) instead of terminal\n");
+    printf("  --port P                 Port for --gui (default: 8787; tries next ports if busy)\n");
     printf("  -h, --help               Show this help\n");
 }
 
@@ -1247,6 +1289,8 @@ static Options parse_args(int argc, char **argv){
     o.default_slitw = 1.50;
     o.infer_from_sci_if_no_csv = true;
     o.debug = false;
+    o.gui = false;
+    o.gui_port = 8787;
 
     for(int i=1;i<argc;i++){
         const char *a=argv[i];
@@ -1259,6 +1303,8 @@ static Options parse_args(int argc, char **argv){
         if(strcmp(a,"--default-slit")==0 && i+1<argc){ o.default_slitw=atof(argv[++i]); continue; }
         if(strcmp(a,"--no-infer-sci")==0){ o.infer_from_sci_if_no_csv=false; continue; }
         if(strcmp(a,"--debug")==0){ o.debug=true; continue; }
+        if(strcmp(a,"--gui")==0){ o.gui=true; continue; }
+        if(strcmp(a,"--port")==0 && i+1<argc){ o.gui_port=atoi(argv[++i]); continue; }
         if(strcmp(a,"-h")==0 || strcmp(a,"--help")==0){ usage(argv[0]); exit(0); }
         fprintf(stderr,"Unknown option: %s\n", a);
         usage(argv[0]);
@@ -1334,12 +1380,476 @@ static void debug_print_requirements(const BinVec *reqBins, const FlatVec *reqFl
     }
 }
 
+
+// ------------------------------
+// Lightweight GUI mode: local web UI (--gui)
+// No external dependencies. Serves a compact HTML page on localhost.
+// ------------------------------
+static void url_decode_inplace(char *s){
+    // Decodes %XX and '+' -> ' ' in-place.
+    char *w=s;
+    for(char *p=s; p && *p; p++){
+        if(*p=='+'){ *w++=' '; }
+        else if(*p=='%' && isxdigit((unsigned char)p[1]) && isxdigit((unsigned char)p[2])){
+            char hx[3]={p[1],p[2],0};
+            *w++ = (char)strtol(hx,NULL,16);
+            p+=2;
+        } else {
+            *w++=*p;
+        }
+    }
+    *w=0;
+}
+
+static bool query_get_value(const char *query, const char *key, char *out, size_t outsz){
+    // query: "a=b&c=d"
+    if(!query || !key || !out || outsz==0) return false;
+    out[0]=0;
+    size_t klen = strlen(key);
+    const char *p = query;
+    while(p && *p){
+        const char *amp = strchr(p,'&');
+        size_t seglen = amp ? (size_t)(amp - p) : strlen(p);
+        const char *eq = memchr(p,'=',seglen);
+        if(eq){
+            size_t nlen = (size_t)(eq - p);
+            if(nlen==klen && strncmp(p,key,klen)==0){
+                size_t vlen = seglen - (size_t)(eq - p) - 1;
+                if(vlen >= outsz) vlen = outsz-1;
+                memcpy(out, eq+1, vlen);
+                out[vlen]=0;
+                url_decode_inplace(out);
+                return true;
+            }
+        }
+        p = amp ? (amp+1) : NULL;
+    }
+    return false;
+}
+
+static void html_escape_fputs(FILE *out, const char *s){
+    if(!s){ return; }
+    for(const unsigned char *p=(const unsigned char*)s; *p; p++){
+        switch(*p){
+            case '&': fputs("&amp;", out); break;
+            case '<': fputs("&lt;", out); break;
+            case '>': fputs("&gt;", out); break;
+            case '"': fputs("&quot;", out); break;
+            case '\'': fputs("&#39;", out); break;
+            default: fputc(*p, out); break;
+        }
+    }
+}
+
+static void html_ratio(FILE *out, int have, int req){
+    if(req<=0){
+        fprintf(out, "%d", have);
+        return;
+    }
+    const char *cls = (have>=req) ? "ok" : "bad";
+    fprintf(out, "<span class=\"%s\">%d/%d</span>", cls, have, req);
+}
+
+static void compute_once_params(
+    const char *dirPath,
+    const char *csvPath,
+    int night_id_in,
+    bool infer_from_sci_if_no_csv,
+    double slit_tol,
+    double default_slitw,
+    bool debug,
+    // outputs:
+    int *night_id_out,
+    bool *csv_ok_out,
+    bool *inferred_out,
+    bool *fallback_out,
+    BinVec *reqBins,
+    FlatVec *reqFlats,
+    BinVec *foundBins,
+    FlatVec *foundFlats,
+    int *nscan_out,
+    int *nmatch_out,
+    SuppressStats *supp_out,
+    CsvStats *csvStats_out
+){
+    // night selection
+    int night_id = night_id_in;
+    NightVec nights={0};
+    if(night_id==0){
+        scan_dir_collect_nights(dirPath, &nights);
+        night_id = nightvec_pick_mode(&nights);
+    }
+
+    if(night_id_out) *night_id_out = night_id;
+    nightvec_free(&nights);
+
+    // CSV requirements
+    bool csv_ok=false;
+    CsvStats csvStats={0};
+    if(csvPath && csvPath[0]){
+        csv_ok = read_required_from_csv(csvPath, reqBins, reqFlats, default_slitw, slit_tol, &csvStats);
+        if(csv_ok && reqBins->n==0 && reqFlats->n==0) csv_ok=false;
+        if(debug){
+            debug_print_csv(csvPath, &csvStats);
+            if(!csv_ok) fprintf(stderr,"[debug] CSV parse yielded no setups; will fall back to SCI inference and/or detected setups.\n");
+        }
+    }
+    if(csv_ok_out) *csv_ok_out = csv_ok;
+    if(csvStats_out) *csvStats_out = csvStats;
+
+    // scan directory & group
+    BinVec sciBins={0};
+    FlatVec sciFlats={0};
+    int nscan=0, nmatch=0;
+    SuppressStats supp={0};
+    ScanStats scanStatsLocal={0};
+
+    scan_dir_counts(dirPath, night_id, foundBins, foundFlats, &sciBins, &sciFlats,
+                    slit_tol, &nscan, &nmatch, &supp, debug?&scanStatsLocal:NULL);
+
+    if(nscan_out) *nscan_out = nscan;
+    if(nmatch_out) *nmatch_out = nmatch;
+    if(supp_out) *supp_out = supp;
+
+    if(debug) debug_print_scan(&scanStatsLocal);
+
+    bool inferred=false;
+    bool fallback=false;
+
+    if(!csv_ok){
+        if(infer_from_sci_if_no_csv){
+            for(int i=0;i<sciBins.n;i++) (void)binvec_find_or_add(reqBins, sciBins.v[i].binspat, sciBins.v[i].binspec);
+            for(int i=0;i<sciFlats.n;i++) (void)flatvec_find_or_add(reqFlats, sciFlats.v[i].binspat, sciFlats.v[i].binspec, sciFlats.v[i].slitw, slit_tol);
+            if(reqBins->n>0 || reqFlats->n>0) inferred=true;
+        }
+    }
+
+    if(reqBins->n==0 && reqFlats->n==0){
+        for(int i=0;i<foundBins->n;i++) (void)binvec_find_or_add(reqBins, foundBins->v[i].binspat, foundBins->v[i].binspec);
+        for(int i=0;i<foundFlats->n;i++) (void)flatvec_find_or_add(reqFlats, foundFlats->v[i].binspat, foundFlats->v[i].binspec, foundFlats->v[i].slitw, slit_tol);
+        fallback = (reqBins->n>0 || reqFlats->n>0);
+    }
+
+    if(reqBins->n>1) qsort(reqBins->v,(size_t)reqBins->n,sizeof(BinGroup),cmp_bin_group);
+    if(reqFlats->n>1) qsort(reqFlats->v,(size_t)reqFlats->n,sizeof(FlatGroup),cmp_flat_group);
+
+    if(inferred_out) *inferred_out = inferred;
+    if(fallback_out) *fallback_out = fallback;
+
+    binvec_free(&sciBins);
+    flatvec_free(&sciFlats);
+}
+
+static void render_dashboard_html(
+    FILE *out,
+    const char *dirPath,
+    int night_id,
+    const char *csvPath,
+    bool csv_ok,
+    bool inferred_from_sci,
+    bool using_detected_fallback,
+    const BinVec *reqBins,
+    const FlatVec *reqFlats,
+    const BinVec *foundBins,
+    const FlatVec *foundFlats,
+    double slit_tol,
+    int nscan,
+    int nmatch,
+    const SuppressStats *supp,
+    int refresh_sec
+){
+    char night_str[32]={0};
+    if(night_id>0) fmt_date_yyyymmdd(night_id, night_str);
+    else night_str[0]=0;
+
+    fputs(
+        "<!doctype html><html><head><meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        "<title>NGPS Cals Status</title>"
+        "<style>"
+        "body{font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial; margin:14px;}"
+        "h1{font-size:18px; margin:0 0 10px 0;}"
+        ".sub{color:#555; font-size:12px; margin-bottom:10px;}"
+        "form{display:flex; flex-wrap:wrap; gap:10px; align-items:end; margin:10px 0 12px 0;}"
+        "label{font-size:12px; color:#444; display:flex; flex-direction:column; gap:4px;}"
+        "input{font-size:12px; padding:6px 8px; border:1px solid #ccc; border-radius:6px; min-width:320px;}"
+        "input.small{min-width:140px;}"
+        "button{font-size:12px; padding:7px 10px; border:1px solid #777; border-radius:8px; background:#f6f6f6; cursor:pointer;}"
+        "table{border-collapse:collapse; width:100%; font-size:12px;}"
+        "th,td{border:1px solid #ddd; padding:4px 6px; text-align:right; white-space:nowrap;}"
+        "th:first-child, td:first-child, th:nth-child(2), td:nth-child(2){text-align:left;}"
+        "thead th{background:#f2f2f2;}"
+        "tr.sep td{border:none; padding:2px; background:transparent;}"
+        ".ok{color:#0a7a2f; font-weight:600;}"
+        ".bad{color:#b00020; font-weight:600;}"
+        ".muted{color:#666;}"
+        ".note{font-size:12px; color:#555; margin:8px 0 12px 0;}"
+        ".grid{display:grid; grid-template-columns:1fr; gap:14px;}"
+        "@media(min-width:1100px){.grid{grid-template-columns:1fr 1fr;}}"
+        "</style>"
+        "</head><body>"
+    , out);
+
+    fprintf(out,"<h1>NGPS calibration status</h1>");
+    fprintf(out,"<div class=\"sub\">files scanned: %d, matched night: %d &nbsp;|&nbsp; slit tol %.2f&quot; &nbsp;|&nbsp; req: THAR=%d FEAR=%d BIAS=%d DOMEFLAT=%d</div>",
+            nscan, nmatch, slit_tol, REQ_THAR, REQ_FEAR, REQ_BIAS, REQ_DOMEFLAT);
+
+    // form (dir/csv/night/refresh)
+    fprintf(out,"<form method=\"GET\" action=\"/\">");
+    fprintf(out,"<label>Data dir<input name=\"dir\" value=\""); html_escape_fputs(out, dirPath?dirPath:""); fprintf(out,"\"></label>");
+    fprintf(out,"<label>CSV<input name=\"csv\" value=\""); html_escape_fputs(out, csvPath?csvPath:""); fprintf(out,"\"></label>");
+    fprintf(out,"<label>Night (YYYYMMDD)<input class=\"small\" name=\"night\" value=\""); html_escape_fputs(out, night_str); fprintf(out,"\"></label>");
+    fprintf(out,"<label>Refresh (s)<input class=\"small\" name=\"refresh\" value=\"%d\"></label>", refresh_sec);
+    fprintf(out,"<button type=\"submit\">Update</button>");
+    fprintf(out,"</form>");
+
+    fprintf(out,"<div class=\"note\">CSV status: ");
+    fprintf(out,"<span class=\"%s\">%s</span>", csv_ok?"ok":"bad", csv_ok?"ok":"FAILED");
+    if(!csvPath || !csvPath[0]) fprintf(out," <span class=\"muted\">(none)</span>");
+    fprintf(out," &nbsp;|&nbsp; required setups: ");
+    if(csv_ok) fprintf(out,"CSV");
+    else if(inferred_from_sci) fprintf(out,"SCI inference");
+    else if(using_detected_fallback) fprintf(out,"detected fallback");
+    else fprintf(out,"none");
+    if(supp) fprintf(out," &nbsp;|&nbsp; suppressed U=%d G=%d", supp->ug_suppressed[0], supp->ug_suppressed[1]);
+    fprintf(out,"</div>");
+
+    fprintf(out,"<div class=\"grid\">");
+
+    // Arcs table
+    fprintf(out,"<div><h1 style=\"font-size:14px; margin:0 0 6px 0;\">Arcs/Bias by binning</h1>");
+    if(reqBins->n==0){
+        fprintf(out,"<div class=\"muted\">No required binnings found.</div></div>");
+    } else {
+        fprintf(out,"<table><thead><tr>"
+                    "<th>Binning</th><th>Ch</th>"
+                    "<th>THAR</th><th>THAR≤2</th>"
+                    "<th>FEAR</th><th>FEAR≤2</th>"
+                    "<th>BIAS</th><th>SCI</th>"
+                    "</tr></thead><tbody>");
+        for(int i=0;i<reqBins->n;i++){
+            int bs=reqBins->v[i].binspat;
+            int bc=reqBins->v[i].binspec;
+            int fi=find_found_bin(foundBins,bs,bc);
+            for(int ch=0; ch<CH_N; ch++){
+                int have_thar=0, have_fear=0, have_bias=0, have_sci=0;
+                int good_thar=0, good_fear=0;
+                if(fi>=0){
+                    have_thar = foundBins->v[fi].thar[ch];
+                    have_fear = foundBins->v[fi].fear[ch];
+                    have_bias = foundBins->v[fi].bias[ch];
+                    have_sci  = foundBins->v[fi].sci[ch];
+                    good_thar = foundBins->v[fi].thar_goodslit[ch];
+                    good_fear = foundBins->v[fi].fear_goodslit[ch];
+                }
+                bool ok = (have_thar>=REQ_THAR) && (have_fear>=REQ_FEAR) && (have_bias>=REQ_BIAS);
+                fprintf(out,"<tr>");
+                if(ch==0) fprintf(out,"<td>%dx%d</td>", bs, bc);
+                else fprintf(out,"<td></td>");
+                fprintf(out,"<td><span class=\"%s\">%s</span></td>", ok?"ok":"bad", CH_NAME[ch]);
+                fprintf(out,"<td>"); html_ratio(out, have_thar, REQ_THAR); fprintf(out,"</td>");
+                fprintf(out,"<td class=\"muted\">%d</td>", good_thar);
+                fprintf(out,"<td>"); html_ratio(out, have_fear, REQ_FEAR); fprintf(out,"</td>");
+                fprintf(out,"<td class=\"muted\">%d</td>", good_fear);
+                fprintf(out,"<td>"); html_ratio(out, have_bias, REQ_BIAS); fprintf(out,"</td>");
+                fprintf(out,"<td>%d</td>", have_sci);
+                fprintf(out,"</tr>");
+            }
+            fprintf(out,"<tr class=\"sep\"><td colspan=\"8\"></td></tr>");
+        }
+        fprintf(out,"</tbody></table></div>");
+    }
+
+    // Flats table
+    fprintf(out,"<div><h1 style=\"font-size:14px; margin:0 0 6px 0;\">Dome flats by setup</h1>");
+    if(reqFlats->n==0){
+        fprintf(out,"<div class=\"muted\">No required dome-flat setups found.</div></div>");
+    } else {
+        fprintf(out,"<table><thead><tr>"
+                    "<th>Setup</th><th>Ch</th><th>DOMEFLAT</th>"
+                    "</tr></thead><tbody>");
+        for(int i=0;i<reqFlats->n;i++){
+            int bs=reqFlats->v[i].binspat;
+            int bc=reqFlats->v[i].binspec;
+            double sw=reqFlats->v[i].slitw;
+            int fi=find_found_flat(foundFlats,bs,bc,sw,slit_tol);
+            for(int ch=0; ch<CH_N; ch++){
+                int have_flat=0;
+                if(fi>=0) have_flat = foundFlats->v[fi].domeflat[ch];
+                bool ok = (have_flat>=REQ_DOMEFLAT);
+                fprintf(out,"<tr>");
+                if(ch==0) fprintf(out,"<td>%dx%d slit %.2f&quot;</td>", bs, bc, sw);
+                else fprintf(out,"<td></td>");
+                fprintf(out,"<td><span class=\"%s\">%s</span></td>", ok?"ok":"bad", CH_NAME[ch]);
+                fprintf(out,"<td>"); html_ratio(out, have_flat, REQ_DOMEFLAT); fprintf(out,"</td>");
+                fprintf(out,"</tr>");
+            }
+            fprintf(out,"<tr class=\"sep\"><td colspan=\"3\"></td></tr>");
+        }
+        fprintf(out,"</tbody></table></div>");
+    }
+
+    fprintf(out,"</div>"); // grid
+
+    // auto refresh
+    fprintf(out,"<script>var r=%d; if(r>0){setTimeout(function(){location.reload();}, r*1000);} </script>", refresh_sec);
+
+    fprintf(out,"</body></html>");
+}
+
+static int bind_listen_port(int start_port, int *chosen_port){
+    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if(sockfd < 0) return -1;
+
+    int yes=1;
+    setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+    struct sockaddr_in addr;
+    memset(&addr,0,sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+    int port = start_port;
+    for(int k=0;k<10;k++,port++){
+        addr.sin_port = htons((uint16_t)port);
+        if(bind(sockfd, (struct sockaddr*)&addr, sizeof(addr))==0){
+            if(listen(sockfd, 16)==0){
+                if(chosen_port) *chosen_port = port;
+                return sockfd;
+            }
+        }
+    }
+    close(sockfd);
+    return -1;
+}
+
+static void try_open_browser(int port){
+    char url[128];
+    snprintf(url,sizeof(url),"http://127.0.0.1:%d/", port);
+#ifdef __APPLE__
+    char cmd[256]; snprintf(cmd,sizeof(cmd),"open \"%s\" >/dev/null 2>&1", url);
+    system(cmd);
+#else
+    char cmd[256]; snprintf(cmd,sizeof(cmd),"xdg-open \"%s\" >/dev/null 2>&1", url);
+    system(cmd);
+#endif
+}
+
+static void handle_http_client(int cfd, const Options *opt){
+    char buf[8192];
+    ssize_t n = recv(cfd, buf, sizeof(buf)-1, 0);
+    if(n<=0) return;
+    buf[n]=0;
+
+    // parse first line
+    char method[8]={0}, pathq[4096]={0};
+    if(sscanf(buf, "%7s %4095s", method, pathq) != 2) return;
+    if(strcmp(method,"GET")!=0){
+        const char *msg = "HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\n";
+        send(cfd, msg, strlen(msg), 0);
+        return;
+    }
+
+    // ignore favicon
+    if(strncmp(pathq, "/favicon.ico", 12)==0){
+        const char *msg = "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n";
+        send(cfd, msg, strlen(msg), 0);
+        return;
+    }
+
+    // split query
+    char *qmark = strchr(pathq,'?');
+    char *query = NULL;
+    if(qmark){ *qmark=0; query = qmark+1; }
+
+    // params with defaults
+    char dir[2048]={0}, csv[2048]={0}, night[64]={0}, refresh[32]={0};
+    snprintf(dir,sizeof(dir),"%s", opt->dirPath?opt->dirPath:"");
+    if(opt->csvPath) snprintf(csv,sizeof(csv),"%s", opt->csvPath);
+
+    if(query){
+        char tmp[2048];
+        if(query_get_value(query,"dir",tmp,sizeof(tmp))) snprintf(dir,sizeof(dir),"%s", tmp);
+        if(query_get_value(query,"csv",tmp,sizeof(tmp))) snprintf(csv,sizeof(csv),"%s", tmp);
+        if(query_get_value(query,"night",tmp,sizeof(tmp))) snprintf(night,sizeof(night),"%s", tmp);
+        if(query_get_value(query,"refresh",tmp,sizeof(tmp))) snprintf(refresh,sizeof(refresh),"%s", tmp);
+    }
+
+    int night_id = (night[0] ? atoi(night) : opt->night_id);
+    int refresh_sec = (refresh[0] ? atoi(refresh) : opt->refresh_sec);
+    if(refresh_sec < 0) refresh_sec = 0;
+
+    const char *csvPath = (csv[0] ? csv : NULL);
+
+    // compute
+    BinVec reqBins={0}, foundBins={0};
+    FlatVec reqFlats={0}, foundFlats={0};
+    bool csv_ok=false, inferred=false, fallback=false;
+    int night_used=0, nscan=0, nmatch=0;
+    SuppressStats supp={0};
+    CsvStats csvStats={0};
+
+    compute_once_params(dir, csvPath, night_id,
+                        opt->infer_from_sci_if_no_csv,
+                        opt->slit_tol, opt->default_slitw,
+                        opt->debug,
+                        &night_used, &csv_ok, &inferred, &fallback,
+                        &reqBins, &reqFlats, &foundBins, &foundFlats,
+                        &nscan, &nmatch, &supp, &csvStats);
+
+    // respond
+    FILE *out = fdopen(dup(cfd), "w");
+    if(out){
+        setvbuf(out, NULL, _IONBF, 0);
+        fprintf(out, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n");
+        render_dashboard_html(out, dir, night_used, csvPath, csv_ok, inferred, fallback,
+                             &reqBins, &reqFlats, &foundBins, &foundFlats,
+                             opt->slit_tol, nscan, nmatch, &supp, refresh_sec);
+        fclose(out);
+    }
+
+    binvec_free(&reqBins); binvec_free(&foundBins);
+    flatvec_free(&reqFlats); flatvec_free(&foundFlats);
+}
+
+static int run_gui_server(const Options *opt){
+    int port = opt->gui_port;
+    if(port <= 0) port = 8787;
+
+    int chosen=0;
+    int sfd = bind_listen_port(port, &chosen);
+    if(sfd < 0){
+        fprintf(stderr,"[gui] Failed to bind localhost port starting at %d\n", port);
+        return 2;
+    }
+
+    fprintf(stderr,"[gui] Listening on http://127.0.0.1:%d/  (Ctrl-C to quit)\n", chosen);
+    try_open_browser(chosen);
+
+    while(1){
+        struct sockaddr_in caddr; socklen_t clen=sizeof(caddr);
+        int cfd = accept(sfd, (struct sockaddr*)&caddr, &clen);
+        if(cfd < 0){
+            if(errno==EINTR) continue;
+            break;
+        }
+        handle_http_client(cfd, opt);
+        close(cfd);
+    }
+    close(sfd);
+    return 0;
+}
+
 int main(int argc, char **argv){
     // Ensure Palomar local time
     setenv("TZ","America/Los_Angeles",1);
     tzset();
 
     Options opt = parse_args(argc, argv);
+
+    if(opt.gui){
+        return run_gui_server(&opt);
+    }
 
     // Auto-pick night if needed
     NightVec nights={0};
