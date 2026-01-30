@@ -360,10 +360,19 @@ static bool header_is_image_like(const FitsHdr *h){
 // - Anything else is SCI (per your request)
 // ------------------------------
 static void normalize_imgtype(const char *in, char out[16]){
+    // Normalize IMGTYPE to one of:
+    //   THAR, FEAR, DOMEFLAT, BIAS, DARK, CONT, SCI, OTHER
+    // Rules:
+    //   - Science frames must have IMGTYPE exactly "SCI"
+    //   - A calibration frame counts only if IMGTYPE is one of:
+    //     FEAR, THAR, DOMEFLAT, DARK, BIAS, CONT
     char tmp[64]={0};
     snprintf(tmp,sizeof(tmp),"%s", in?in:"");
     trim(tmp);
     strtoupper_inplace(tmp);
+
+    // SCI must be exact
+    if(strcmp(tmp,"SCI")==0) { strncpy(out,"SCI",16); return; }
 
     if(str_icontains(tmp,"THAR")) { strncpy(out,"THAR",16); return; }
     if(str_icontains(tmp,"FEAR")) { strncpy(out,"FEAR",16); return; }
@@ -371,12 +380,23 @@ static void normalize_imgtype(const char *in, char out[16]){
     if(str_icontains(tmp,"DOMEFLAT") || (str_icontains(tmp,"DOME") && str_icontains(tmp,"FLAT"))) {
         strncpy(out,"DOMEFLAT",16); return;
     }
-    // Treat everything else as science for now
-    strncpy(out,"SCI",16);
+    if(str_icontains(tmp,"DARK")) { strncpy(out,"DARK",16); return; }
+    if(str_icontains(tmp,"CONT")) { strncpy(out,"CONT",16); return; }
+
+    strncpy(out,"OTHER",16);
 }
 
 static bool is_cal_type(const char *imgtype){
-    return (strcmp(imgtype,"THAR")==0 || strcmp(imgtype,"FEAR")==0 || strcmp(imgtype,"BIAS")==0 || strcmp(imgtype,"DOMEFLAT")==0);
+    return (strcmp(imgtype,"THAR")==0 ||
+            strcmp(imgtype,"FEAR")==0 ||
+            strcmp(imgtype,"BIAS")==0 ||
+            strcmp(imgtype,"DOMEFLAT")==0 ||
+            strcmp(imgtype,"DARK")==0 ||
+            strcmp(imgtype,"CONT")==0);
+}
+
+static bool is_sci_type(const char *imgtype){
+    return (strcmp(imgtype,"SCI")==0);
 }
 
 // ------------------------------
@@ -452,7 +472,7 @@ static FileMeta scan_fits_file_multi(const char *path){
     memset(&out,0,sizeof(out));
     out.ok=false;
     out.night_id=0;
-    strncpy(out.base_imgtype,"SCI",sizeof(out.base_imgtype));
+    strncpy(out.base_imgtype,"OTHER",sizeof(out.base_imgtype));
     out.base_binspat=-1;
     out.base_binspec=-1;
     out.base_slitw=NAN;
@@ -485,7 +505,7 @@ static FileMeta scan_fits_file_multi(const char *path){
         }
 
         // Image-like extensions are per channel
-        if(hdu>0 && header_is_image_like(&hdr)){
+        if(hdu>0){
             int idx = specIdToIndex(hdr.SPEC_ID);
             if(idx>=0 && idx<CH_N && !out.ch[idx].present){
                 ChanMeta *cm = &out.ch[idx];
@@ -803,8 +823,9 @@ typedef struct {
 
 typedef struct {
     int files_ok;
-    int type_counts[CH_N][6];
-    // type idx: 0 THAR,1 FEAR,2 BIAS,3 DOMEFLAT,4 SCI,5 OTHER(unused)
+    int type_counts[CH_N][8];
+    // type idx:
+    //  0 THAR, 1 FEAR, 2 BIAS, 3 DOMEFLAT, 4 DARK, 5 CONT, 6 SCI, 7 OTHER
     int ch_present[CH_N];
     int ch_det_on[CH_N];
 } ScanStats;
@@ -814,8 +835,10 @@ static int type_index(const char *imgtype){
     if(strcmp(imgtype,"FEAR")==0) return 1;
     if(strcmp(imgtype,"BIAS")==0) return 2;
     if(strcmp(imgtype,"DOMEFLAT")==0) return 3;
-    if(strcmp(imgtype,"SCI")==0) return 4;
-    return 5;
+    if(strcmp(imgtype,"DARK")==0) return 4;
+    if(strcmp(imgtype,"CONT")==0) return 5;
+    if(strcmp(imgtype,"SCI")==0) return 6;
+    return 7;
 }
 
 static void scan_dir_counts(
@@ -865,13 +888,14 @@ static void scan_dir_counts(
                 scanStats->ch_present[ch]++;
                 if(cm->det_on) scanStats->ch_det_on[ch]++;
                 int ti = type_index(cm->imgtype);
-                if(ti>=0 && ti<6) scanStats->type_counts[ch][ti]++;
+                if(ti>=0 && ti<8) scanStats->type_counts[ch][ti]++;
             }
 
+            bool is_sci = is_sci_type(cm->imgtype);
             bool is_cal = is_cal_type(cm->imgtype);
 
-            // SCI handling: ignore DBIAS and ignore R/I-off constraints
-            if(!is_cal){
+            // SCI handling: must be IMGTYPE=="SCI" (no DBIAS gating)
+            if(is_sci){
                 int bi = binvec_find_or_add(foundBins, cm->binspat, cm->binspec);
                 foundBins->v[bi].sci[ch]++;
 
@@ -879,6 +903,11 @@ static void scan_dir_counts(
                 sciBins->v[sbi].sci[ch]++;
 
                 if(isfinite(cm->slitw)) (void)flatvec_find_or_add(sciFlats, cm->binspat, cm->binspec, cm->slitw, slit_tol);
+                continue;
+            }
+
+            // Ignore anything that's not SCI and not one of the allowed calibration IMGTYPEs
+            if(!is_cal){
                 continue;
             }
 
@@ -928,6 +957,44 @@ static void print_count_cell(int have, int req, bool tty){
     else printf("%s%2d/%-2d%s", tty?C_RED:"", have, req, tty?C_RESET:"");
 }
 
+// ------------------------------
+// Simple ASCII table printer (manual; no external deps)
+// ------------------------------
+static void table_border(const int *w, int ncols, char ch){
+    putchar('+');
+    for(int i=0;i<ncols;i++){
+        for(int k=0;k<w[i]+2;k++) putchar(ch);
+        putchar('+');
+    }
+    putchar('\n');
+}
+
+static void table_row(const int *w, const bool *right, const char **cells, int ncols){
+    putchar('|');
+    for(int i=0;i<ncols;i++){
+        int len = (int)strlen(cells[i]);
+        int pad = w[i] - len;
+        if(pad < 0) pad = 0;
+
+        putchar(' ');
+        if(right && right[i]){
+            for(int k=0;k<pad;k++) putchar(' ');
+            fputs(cells[i], stdout);
+        } else {
+            fputs(cells[i], stdout);
+            for(int k=0;k<pad;k++) putchar(' ');
+        }
+        putchar(' ');
+        putchar('|');
+    }
+    putchar('\n');
+}
+
+static void fmt_ratio(char *buf, size_t n, int have, int req){
+    if(req > 0) snprintf(buf, n, "%d/%d", have, req);
+    else snprintf(buf, n, "%d", have);
+}
+
 static void render_dashboard(
     const char *dirPath,
     int night_id,
@@ -945,20 +1012,22 @@ static void render_dashboard(
     const SuppressStats *supp,
     bool do_clear
 ){
-    bool tty = is_tty_stdout();
     if(do_clear) clear_screen();
 
     time_t now=time(NULL);
     struct tm lt; localtime_r(&now,&lt);
     char tbuf[64]; strftime(tbuf,sizeof(tbuf),"%Y-%m-%d %H:%M:%S %Z",&lt);
 
-    char nbuf[16]; fmt_date_yyyymmdd(night_id, nbuf);
+    char nbuf[16];
+    if(night_id>0) fmt_date_yyyymmdd(night_id, nbuf);
+    else snprintf(nbuf,sizeof(nbuf),"(none)");
 
     printf("NGPS calibration status (multi-ext)  %s\n", tbuf);
     printf("Directory: %s\n", dirPath);
     printf("Night label: %s   (files scanned: %d, matched night: %d)\n", nbuf, nscan, nmatch);
     printf("Requirements per setup & per channel: THAR=%d FEAR=%d BIAS=%d DOMEFLAT=%d\n", REQ_THAR, REQ_FEAR, REQ_BIAS, REQ_DOMEFLAT);
     printf("U/G cal counts only include cal frames where R & I detectors are OFF (R.DBias<=0 AND I.DBias<=0).\n");
+    printf("Cal frames are counted only if IMGTYPE is one of: FEAR, THAR, DOMEFLAT, DARK, BIAS, CONT. Science frames only if IMGTYPE==SCI.\n");
     printf("Flat slit match tolerance: %.2f\"\n", slit_tol);
 
     if(csvPath){
@@ -966,114 +1035,179 @@ static void render_dashboard(
     } else {
         printf("CSV: (none)\n");
     }
-
     if(inferred_from_sci) printf("Required setups: inferred from SCI frames\n");
     if(using_detected_fallback) printf("Required setups: showing detected setups (no CSV/inference setups found)\n");
 
     if(supp){
-        printf("%sSuppressed U/G cal channel-frames (IMGTYPE ok but R/I not both OFF): U=%d, G=%d%s\n",
-               tty?C_DIM:"", supp->ug_suppressed[0], supp->ug_suppressed[1], tty?C_RESET:"");
+        printf("Suppressed U/G cal channel-frames (IMGTYPE cal but R/I not both OFF): U=%d, G=%d\n",
+               supp->ug_suppressed[0], supp->ug_suppressed[1]);
     }
     printf("\n");
 
-    // ---- Arcs/Bias by binning ----
+    // ==========================
+    // Arcs/Bias by binning table
+    // ==========================
     printf("== Arcs/Bias by binning (BINSPAT x BINSPEC) ==\n");
-    printf("%-8s %-4s  %-16s  %-16s  %-16s  %-6s\n", "Binning", "Ch", "THAR", "FEAR", "BIAS", "SCI");
-    printf("-------- ----  ----------------  ----------------  ----------------  ------\n");
 
-    int complete_by_ch_bins[CH_N]={0,0,0,0};
+    if(reqBins->n == 0){
+        printf("(no required binnings found)\n\n");
+    } else {
+        enum { NC_ARC = 8 };
+        const char *hdr[NC_ARC] = {"Binning","Ch","THAR","THAR<=2","FEAR","FEAR<=2","BIAS","SCI"};
+        bool right[NC_ARC]      = {false,false,true,true,true,true,true,true};
+        int w[NC_ARC];
+        for(int i=0;i<NC_ARC;i++) w[i]=(int)strlen(hdr[i]);
 
-    for(int i=0;i<reqBins->n;i++){
-        int bs=reqBins->v[i].binspat;
-        int bc=reqBins->v[i].binspec;
-        int fi=find_found_bin(foundBins,bs,bc);
+        int nrows = reqBins->n * CH_N;
+        typedef struct { char c[NC_ARC][64]; } Row;
+        Row *rows = (Row*)calloc((size_t)nrows, sizeof(Row));
+        if(!rows){ perror("calloc"); exit(2); }
 
-        for(int ch=0; ch<CH_N; ch++){
-            int have_thar=0, have_fear=0, have_bias=0, have_sci=0;
-            int good_thar=0, good_fear=0;
-            if(fi>=0){
-                have_thar = foundBins->v[fi].thar[ch];
-                have_fear = foundBins->v[fi].fear[ch];
-                have_bias = foundBins->v[fi].bias[ch];
-                have_sci  = foundBins->v[fi].sci[ch];
-                good_thar = foundBins->v[fi].thar_goodslit[ch];
-                good_fear = foundBins->v[fi].fear_goodslit[ch];
+        int ridx=0;
+        int complete_by_ch_bins[CH_N]={0,0,0,0};
+
+        for(int i=0;i<reqBins->n;i++){
+            int bs=reqBins->v[i].binspat;
+            int bc=reqBins->v[i].binspec;
+            int fi=find_found_bin(foundBins,bs,bc);
+
+            for(int ch=0; ch<CH_N; ch++){
+                int have_thar=0, have_fear=0, have_bias=0, have_sci=0;
+                int good_thar=0, good_fear=0;
+
+                if(fi>=0){
+                    have_thar = foundBins->v[fi].thar[ch];
+                    have_fear = foundBins->v[fi].fear[ch];
+                    have_bias = foundBins->v[fi].bias[ch];
+                    have_sci  = foundBins->v[fi].sci[ch];
+                    good_thar = foundBins->v[fi].thar_goodslit[ch];
+                    good_fear = foundBins->v[fi].fear_goodslit[ch];
+                }
+
+                bool ok = (have_thar>=REQ_THAR) && (have_fear>=REQ_FEAR) && (have_bias>=REQ_BIAS);
+                if(ok) complete_by_ch_bins[ch]++;
+
+                if(ch==0) snprintf(rows[ridx].c[0], sizeof(rows[ridx].c[0]), "%dx%d", bs, bc);
+                else      rows[ridx].c[0][0]=0;
+
+                snprintf(rows[ridx].c[1], sizeof(rows[ridx].c[1]), "%s", CH_NAME[ch]);
+                fmt_ratio(rows[ridx].c[2], sizeof(rows[ridx].c[2]), have_thar, REQ_THAR);
+                snprintf(rows[ridx].c[3], sizeof(rows[ridx].c[3]), "%d", good_thar);
+                fmt_ratio(rows[ridx].c[4], sizeof(rows[ridx].c[4]), have_fear, REQ_FEAR);
+                snprintf(rows[ridx].c[5], sizeof(rows[ridx].c[5]), "%d", good_fear);
+                fmt_ratio(rows[ridx].c[6], sizeof(rows[ridx].c[6]), have_bias, REQ_BIAS);
+                snprintf(rows[ridx].c[7], sizeof(rows[ridx].c[7]), "%d", have_sci);
+
+                for(int k=0;k<NC_ARC;k++){
+                    int L=(int)strlen(rows[ridx].c[k]);
+                    if(L>w[k]) w[k]=L;
+                }
+                ridx++;
             }
-
-            bool ok = (have_thar>=REQ_THAR) && (have_fear>=REQ_FEAR) && (have_bias>=REQ_BIAS);
-            if(ok) complete_by_ch_bins[ch]++;
-
-            if(ch==0) printf("%2dx%-5d ", bs, bc);
-            else      printf("%8s ", "");
-
-            printf("%-4s  ", CH_NAME[ch]);
-
-            print_count_cell(have_thar, REQ_THAR, tty);
-            printf("%s(%d<=2\")%s  ", tty?C_DIM:"", good_thar, tty?C_RESET:"");
-
-            print_count_cell(have_fear, REQ_FEAR, tty);
-            printf("%s(%d<=2\")%s  ", tty?C_DIM:"", good_fear, tty?C_RESET:"");
-
-            print_count_cell(have_bias, REQ_BIAS, tty);
-            printf("  ");
-
-            printf("%d", have_sci);
-            printf("\n");
         }
-        printf("\n");
-    }
 
-    if(reqBins->n==0){
-        printf("%s(no required binnings found)%s\n\n", tty?C_DIM:"", tty?C_RESET:"");
-    }
+        table_border(w, NC_ARC, '-');
+        table_row(w, right, hdr, NC_ARC);
+        table_border(w, NC_ARC, '=');
 
-    // ---- Flats by setup ----
-    printf("== Dome flats by setup (BINSPAT x BINSPEC, SLITW) ==\n");
-    printf("%-16s %-4s  %-16s\n", "Setup", "Ch", "DOMEFLAT");
-    printf("---------------- ----  ----------------\n");
+        ridx=0;
+        for(int i=0;i<reqBins->n;i++){
+            for(int ch=0; ch<CH_N; ch++){
+                const char *cells[NC_ARC];
+                for(int k=0;k<NC_ARC;k++) cells[k]=rows[ridx].c[k];
+                table_row(w, right, cells, NC_ARC);
+                ridx++;
+            }
+            table_border(w, NC_ARC, '-');
+        }
 
-    int complete_by_ch_flats[CH_N]={0,0,0,0};
+        free(rows);
 
-    for(int i=0;i<reqFlats->n;i++){
-        int bs=reqFlats->v[i].binspat;
-        int bc=reqFlats->v[i].binspec;
-        double sw=reqFlats->v[i].slitw;
-        int fi=find_found_flat(foundFlats,bs,bc,sw,slit_tol);
-
+        printf("\nSummary (complete arcs/bias setups / required setups):\n");
         for(int ch=0; ch<CH_N; ch++){
-            int have_flat=0;
-            if(fi>=0) have_flat = foundFlats->v[fi].domeflat[ch];
-            bool ok = (have_flat>=REQ_DOMEFLAT);
-            if(ok) complete_by_ch_flats[ch]++;
-
-            char label[64];
-            snprintf(label,sizeof(label),"%dx%d slit %.2f\"",bs,bc,sw);
-
-            if(ch==0) printf("%-16s ", label);
-            else      printf("%16s ", "");
-
-            printf("%-4s  ", CH_NAME[ch]);
-            print_count_cell(have_flat, REQ_DOMEFLAT, tty);
-            printf("\n");
+            printf("  %s: %d/%d\n", CH_NAME[ch], complete_by_ch_bins[ch], reqBins->n);
         }
         printf("\n");
     }
 
-    if(reqFlats->n==0){
-        printf("%s(no required dome-flat setups found)%s\n\n", tty?C_DIM:"", tty?C_RESET:"");
+    // ======================
+    // Dome flats by setup
+    // ======================
+    printf("== Dome flats by setup (BINSPAT x BINSPEC, SLITW) ==\n");
+
+    if(reqFlats->n == 0){
+        printf("(no required dome-flat setups found)\n\n");
+    } else {
+        enum { NC_FLAT = 3 };
+        const char *hdr[NC_FLAT] = {"Setup","Ch","DOMEFLAT"};
+        bool right[NC_FLAT]      = {false,false,true};
+        int w[NC_FLAT];
+        for(int i=0;i<NC_FLAT;i++) w[i]=(int)strlen(hdr[i]);
+
+        int nrows = reqFlats->n * CH_N;
+        typedef struct { char c[NC_FLAT][96]; } Row;
+        Row *rows = (Row*)calloc((size_t)nrows, sizeof(Row));
+        if(!rows){ perror("calloc"); exit(2); }
+
+        int ridx=0;
+        int complete_by_ch_flats[CH_N]={0,0,0,0};
+
+        for(int i=0;i<reqFlats->n;i++){
+            int bs=reqFlats->v[i].binspat;
+            int bc=reqFlats->v[i].binspec;
+            double sw=reqFlats->v[i].slitw;
+            int fi=find_found_flat(foundFlats,bs,bc,sw,slit_tol);
+
+            for(int ch=0; ch<CH_N; ch++){
+                int have_flat=0;
+                if(fi>=0) have_flat = foundFlats->v[fi].domeflat[ch];
+                if(have_flat>=REQ_DOMEFLAT) complete_by_ch_flats[ch]++;
+
+                if(ch==0) snprintf(rows[ridx].c[0], sizeof(rows[ridx].c[0]), "%dx%d slit %.2f\"", bs, bc, sw);
+                else      rows[ridx].c[0][0]=0;
+
+                snprintf(rows[ridx].c[1], sizeof(rows[ridx].c[1]), "%s", CH_NAME[ch]);
+                fmt_ratio(rows[ridx].c[2], sizeof(rows[ridx].c[2]), have_flat, REQ_DOMEFLAT);
+
+                for(int k=0;k<NC_FLAT;k++){
+                    int L=(int)strlen(rows[ridx].c[k]);
+                    if(L>w[k]) w[k]=L;
+                }
+                ridx++;
+            }
+        }
+
+        table_border(w, NC_FLAT, '-');
+        table_row(w, right, hdr, NC_FLAT);
+        table_border(w, NC_FLAT, '=');
+
+        ridx=0;
+        for(int i=0;i<reqFlats->n;i++){
+            for(int ch=0; ch<CH_N; ch++){
+                const char *cells[NC_FLAT];
+                for(int k=0;k<NC_FLAT;k++) cells[k]=rows[ridx].c[k];
+                table_row(w, right, cells, NC_FLAT);
+                ridx++;
+            }
+            table_border(w, NC_FLAT, '-');
+        }
+
+        free(rows);
+
+        printf("\nSummary (complete domeflat setups / required setups):\n");
+        for(int ch=0; ch<CH_N; ch++){
+            printf("  %s: %d/%d\n", CH_NAME[ch], complete_by_ch_flats[ch], reqFlats->n);
+        }
+        printf("\n");
     }
 
-    printf("Summary (complete setups / required setups):\n");
-    for(int ch=0; ch<CH_N; ch++){
-        printf("  %s: arcs/bias %d/%d, domeflats %d/%d\n", CH_NAME[ch], complete_by_ch_bins[ch], reqBins->n, complete_by_ch_flats[ch], reqFlats->n);
-    }
-
-    printf("\nKeys: q=quit  r=refresh now\n");
+    printf("Keys: q=quit  r=refresh now\n");
     fflush(stdout);
 }
 
 // ------------------------------
 // Options
+
 // ------------------------------
 typedef struct {
     const char *dirPath;
@@ -1168,9 +1302,35 @@ static void debug_print_scan(const ScanStats *ss){
     if(!ss) return;
     fprintf(stderr,"[debug] Scan ok files: %d\n", ss->files_ok);
     for(int ch=0; ch<CH_N; ch++){
-        fprintf(stderr,"[debug]  %s: present=%d det_on=%d  types: THAR=%d FEAR=%d BIAS=%d DOMEFLAT=%d SCI=%d\n",
+        fprintf(stderr,
+                "[debug]  %s: present=%d det_on=%d  types: THAR=%d FEAR=%d BIAS=%d DOMEFLAT=%d DARK=%d CONT=%d SCI=%d OTHER=%d\n",
                 CH_NAME[ch], ss->ch_present[ch], ss->ch_det_on[ch],
-                ss->type_counts[ch][0], ss->type_counts[ch][1], ss->type_counts[ch][2], ss->type_counts[ch][3], ss->type_counts[ch][4]);
+                ss->type_counts[ch][0], ss->type_counts[ch][1], ss->type_counts[ch][2], ss->type_counts[ch][3],
+                ss->type_counts[ch][4], ss->type_counts[ch][5], ss->type_counts[ch][6], ss->type_counts[ch][7]);
+    }
+}
+
+
+static void debug_print_requirements(const BinVec *reqBins, const FlatVec *reqFlats, bool from_csv, bool inferred_from_sci, bool using_detected_fallback){
+    fprintf(stderr,"[debug] Requirements source: %s%s%s\n",
+            from_csv ? "CSV" : (inferred_from_sci ? "SCI inference" : (using_detected_fallback ? "detected fallback" : "none")),
+            (from_csv ? "" : ""),
+            "");
+    if(reqBins){
+        fprintf(stderr,"[debug]  required bin setups (%d):", reqBins->n);
+        for(int i=0;i<reqBins->n;i++){
+            fprintf(stderr," %dx%d", reqBins->v[i].binspat, reqBins->v[i].binspec);
+            if(i<reqBins->n-1) fprintf(stderr,",");
+        }
+        fprintf(stderr,"\n");
+    }
+    if(reqFlats){
+        fprintf(stderr,"[debug]  required flat setups (%d):", reqFlats->n);
+        for(int i=0;i<reqFlats->n;i++){
+            fprintf(stderr," %dx%d slit %.2f\"", reqFlats->v[i].binspat, reqFlats->v[i].binspec, reqFlats->v[i].slitw);
+            if(i<reqFlats->n-1) fprintf(stderr,",");
+        }
+        fprintf(stderr,"\n");
     }
 }
 
@@ -1245,7 +1405,11 @@ int main(int argc, char **argv){
         if(reqBins.n>1) qsort(reqBins.v,(size_t)reqBins.n,sizeof(BinGroup),cmp_bin_group);
         if(reqFlats.n>1) qsort(reqFlats.v,(size_t)reqFlats.n,sizeof(FlatGroup),cmp_flat_group);
 
-        render_dashboard(opt.dirPath, opt.night_id, opt.csvPath, csv_ok, inferred_from_sci, using_detected_fallback,
+        
+        if(opt.debug && first_loop){
+            debug_print_requirements(&reqBins, &reqFlats, csv_ok, inferred_from_sci, using_detected_fallback);
+        }
+render_dashboard(opt.dirPath, opt.night_id, opt.csvPath, csv_ok, inferred_from_sci, using_detected_fallback,
                          &reqBins, &reqFlats, &foundBins, &foundFlats, opt.slit_tol, nscan, nmatch, &supp, do_clear);
 
         binvec_free(&foundBins); flatvec_free(&foundFlats);
