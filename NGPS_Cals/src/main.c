@@ -788,8 +788,9 @@ static void scan_dir_counts(
             // Ignore anything that's not SCI and not one of the allowed calibration IMGTYPEs
             if(!is_cal) continue;
 
-            // U/G cal gating: require R and I extensions absent
-            bool need_ri_absent = (ch==CH_U || ch==CH_G);
+            // U/G cal gating: require R and I extensions absent for long-exposure cals.
+            // IMPORTANT: BIAS frames are valid even when all four channels are present.
+            bool need_ri_absent = ((ch==CH_U || ch==CH_G) && strcmp(cm->imgtype,"BIAS")!=0);
             if(need_ri_absent && !ri_absent){
                 if(supp){
                     if(ch==CH_U) supp->ug_suppressed[0]++;
@@ -924,8 +925,8 @@ static void render_dashboard(
     printf("Directory: %s\n", dirPath);
     printf("Files scanned: %d, FITS ok: %d\n", nscan, nmatch);
     printf("Requirements per setup & per channel: THAR=%d FEAR=%d BIAS=%d DOMEFLAT=%d\n", REQ_THAR, REQ_FEAR, REQ_BIAS, REQ_DOMEFLAT);
-    printf("U/G cal counts only include cal frames where R & I detectors are OFF (R.DBias<=0 AND I.DBias<=0).\n");
     printf("Cal frames are counted only if IMGTYPE is one of: FEAR, THAR, DOMEFLAT, DARK, BIAS, CONT. Science frames only if IMGTYPE==SCI.\n");
+    printf("U/G flat counts only include cal frames where R & I detectors are OFF.\n");
     printf("Flat slit match tolerance: %.2f\"\n", slit_tol);
 
     if(csvPath){
