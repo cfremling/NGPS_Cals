@@ -1,18 +1,18 @@
-// ngps_cals_status_v5.c
+// ngps_cals_status_v7.c
 // Terminal status dashboard for NGPS calibration completeness (multi-extension NGPS FITS).
 //
-// v5 updates (Jan 2026):
+// v7 updates (Jan 2026):
 //  - ANSI red/green completion highlighting in terminal tables (no change to counting logic)
-//  - Optional --gui: lightweight local web UI with compact tables and editable dir/csv/night fields
+//  - Optional --gui: lightweight local web UI with compact tables and editable dir/csv fields
 //  - Table printer aligns correctly even with ANSI color codes
 //  - Underlying scan/count/group logic unchanged from v4
 //
 // Build:
-//   gcc -O2 -Wall -Wextra -std=c11 -o ngps_cals_status ngps_cals_status_v5.c -lm
+//   gcc -O2 -Wall -Wextra -std=c11 -o ngps_cals_status ngps_cals_status_v7.c -lm
 //
 // Examples:
 //   ./ngps_cals_status --dir /data/latest
-//   ./ngps_cals_status --dir /data/latest --csv ngps_20260128.csv  20260128
+//   ./ngps_cals_status --dir /data/latest --csv ngps_20260128.csv
 //   ./ngps_cals_status --dir /data/latest --csv ngps_20260128.csv --debug --once
 //   ./ngps_cals_status --gui --dir /data/latest --csv ngps_20260128.csv
 
@@ -55,9 +55,7 @@ static const char *CH_NAME[CH_N] = {"U","G","R","I"};
 // ------------------------------
 static const char *C_RESET = "\033[0m";
 static const char *C_GREEN = "\033[32m";
-static const char *C_YELL  = "\033[33m";
 static const char *C_RED   = "\033[31m";
-static const char *C_DIM   = "\033[2m";
 
 static bool is_tty_stdout(void){ return isatty(STDOUT_FILENO); }
 
@@ -146,65 +144,15 @@ static int term_read_key_nonblock(void){
 }
 
 // ------------------------------
-// Night labeling (Palomar local time)
-// ------------------------------
-static bool parse_date_obs_utc(const char *s, time_t *out_utc){
-    if(!s || !*s) return false;
-    int Y=0,M=0,D=0,h=0,m=0;
-    double sec=0.0;
-    int n = sscanf(s, "%d-%d-%dT%d:%d:%lf", &Y,&M,&D,&h,&m,&sec);
-    if(n<3) n = sscanf(s, "%d-%d-%d %d:%d:%lf", &Y,&M,&D,&h,&m,&sec);
-    if(n<3) return false;
-    if(n==3){ h=0; m=0; sec=0.0; }
-    struct tm t = {0};
-    t.tm_year = Y-1900; t.tm_mon = M-1; t.tm_mday = D;
-    t.tm_hour = h; t.tm_min = m; t.tm_sec = (int)floor(sec+1e-9);
-#ifdef __USE_GNU
-    time_t tt = timegm(&t);
-#else
-    char *old = getenv("TZ");
-    setenv("TZ","UTC",1); tzset();
-    time_t tt = mktime(&t);
-    if(old) setenv("TZ", old, 1); else unsetenv("TZ");
-    tzset();
-#endif
-    if(tt==(time_t)-1) return false;
-    *out_utc = tt;
-    return true;
-}
-
-static int yyyymmdd_from_local_night(time_t utc){
-    struct tm lt;
-    localtime_r(&utc, &lt);
-    if(lt.tm_hour < 12){
-        utc -= 86400;
-        localtime_r(&utc, &lt);
-    }
-    int y = lt.tm_year + 1900;
-    int mo = lt.tm_mon + 1;
-    int d = lt.tm_mday;
-    return y*10000 + mo*100 + d;
-}
-
-static void fmt_date_yyyymmdd(int night_id, char out[16]){
-    int y = night_id/10000;
-    int m = (night_id/100)%100;
-    int d = night_id%100;
-    snprintf(out,16,"%04d-%02d-%02d",y,m,d);
-}
-
-// ------------------------------
 // FITS header parser (header-only)
 // ------------------------------
 typedef struct {
     // keys we care about
     char IMGTYPE[32];
-    char DATEOBS[64];
     int BINSPAT;
     int BINSPEC;
     double SLITW;
     char SPEC_ID[32];
-    double DBIAS;
 
     // for skipping data
     int BITPIX;
@@ -219,7 +167,6 @@ static void fits_hdr_init(FitsHdr *h){
     memset(h,0,sizeof(*h));
     h->BINSPAT=-1; h->BINSPEC=-1;
     h->SLITW = NAN;
-    h->DBIAS = NAN;
     h->BITPIX=0; h->NAXIS=0; h->PCOUNT=0; h->GCOUNT=1;
     for(int i=0;i<8;i++) h->NAXISn[i]=0;
 }
@@ -250,20 +197,21 @@ static void parse_value_string(const char *val, char *out, size_t outsz){
     if(!val || !out || outsz==0) return;
     out[0]=0;
     while(*val && isspace((unsigned char)*val)) val++;
-    if(*val=='\''){ // quoted
+
+    char tmp[256]={0};
+    size_t i=0;
+    if(*val=='\''){
         val++;
-        char tmp[256]={0};
-        size_t i=0;
         while(*val && *val!='\'' && i<sizeof(tmp)-1) tmp[i++]=*val++;
-        tmp[i]=0;
-        trim(tmp);
-        snprintf(out,outsz,"%s",tmp);
     } else {
-        char tmp[256]={0};
-        snprintf(tmp,sizeof(tmp),"%s",val);
-        trim(tmp);
-        snprintf(out,outsz,"%s",tmp);
+        while(*val && i<sizeof(tmp)-1) tmp[i++]=*val++;
     }
+    tmp[i]=0;
+    trim(tmp);
+    size_t n = strlen(tmp);
+    if(n >= outsz) n = outsz-1;
+    memcpy(out, tmp, n);
+    out[n]=0;
 }
 
 static double parse_value_double(const char *val, bool *ok){
@@ -303,8 +251,6 @@ static void parse_card(FitsHdr *h, const char card[81]){
     bool ok=false;
     if(str_ieq(key,"IMGTYPE")){
         parse_value_string(valbuf, h->IMGTYPE, sizeof(h->IMGTYPE));
-    } else if(str_ieq(key,"DATE-OBS") || str_ieq(key,"DATEOBS")){
-        parse_value_string(valbuf, h->DATEOBS, sizeof(h->DATEOBS));
     } else if(str_ieq(key,"BINSPAT")){
         h->BINSPAT = (int)parse_value_i64(valbuf,&ok);
     } else if(str_ieq(key,"BINSPEC")){
@@ -313,8 +259,6 @@ static void parse_card(FitsHdr *h, const char card[81]){
         h->SLITW = parse_value_double(valbuf,&ok);
     } else if(str_ieq(key,"SPEC_ID")){
         parse_value_string(valbuf, h->SPEC_ID, sizeof(h->SPEC_ID));
-    } else if(str_ieq(key,"DBIAS")){
-        h->DBIAS = parse_value_double(valbuf,&ok);
     } else if(str_ieq(key,"BITPIX")){
         h->BITPIX = (int)parse_value_i64(valbuf,&ok);
     } else if(str_ieq(key,"NAXIS")){
@@ -348,13 +292,6 @@ static bool read_header_cards(FILE *fp, FitsHdr *hdr, int64_t *hdrBytes){
         }
     }
     return true;
-}
-
-static bool header_is_image_like(const FitsHdr *h){
-    if(h->NAXIS < 2) return false;
-    if(h->XTENSION[0]==0) return true;
-    if(str_ieq(h->XTENSION,"IMAGE")) return true;
-    return false;
 }
 
 // ------------------------------
@@ -441,14 +378,11 @@ typedef struct {
     int ext; // hdu index
     int binspat, binspec;
     double slitw;
-    double dbias;
-    bool det_on;
     char imgtype[16];
 } ChanMeta;
 
 typedef struct {
     bool ok;
-    int night_id; // local night label
 
     // primary fallback
     char base_imgtype[16];
@@ -465,8 +399,6 @@ static void chanmeta_init(ChanMeta *c){
     c->binspat=-1;
     c->binspec=-1;
     c->slitw=NAN;
-    c->dbias=NAN;
-    c->det_on=true;
     strncpy(c->imgtype,"SCI",sizeof(c->imgtype));
 }
 
@@ -474,7 +406,6 @@ static FileMeta scan_fits_file_multi(const char *path){
     FileMeta out;
     memset(&out,0,sizeof(out));
     out.ok=false;
-    out.night_id=0;
     strncpy(out.base_imgtype,"OTHER",sizeof(out.base_imgtype));
     out.base_binspat=-1;
     out.base_binspec=-1;
@@ -495,19 +426,15 @@ static FileMeta scan_fits_file_multi(const char *path){
         int64_t hdrBytes=0;
         if(!read_header_cards(fp,&hdr,&hdrBytes)) break;
 
-        // Primary HDU
+        // Primary HDU: fallback values
         if(hdu==0){
-            if(hdr.DATEOBS[0]){
-                time_t utc;
-                if(parse_date_obs_utc(hdr.DATEOBS,&utc)) out.night_id = yyyymmdd_from_local_night(utc);
-            }
             if(hdr.IMGTYPE[0]) normalize_imgtype(hdr.IMGTYPE, out.base_imgtype);
             if(hdr.BINSPAT>0) out.base_binspat = hdr.BINSPAT;
             if(hdr.BINSPEC>0) out.base_binspec = hdr.BINSPEC;
             if(isfinite(hdr.SLITW)) out.base_slitw = hdr.SLITW;
         }
 
-        // Image-like extensions are per channel
+        // Image extensions: per-channel, order arbitrary
         if(hdu>0){
             int idx = specIdToIndex(hdr.SPEC_ID);
             if(idx>=0 && idx<CH_N && !out.ch[idx].present){
@@ -525,13 +452,6 @@ static FileMeta scan_fits_file_multi(const char *path){
 
                 // slit (fallback)
                 cm->slitw = isfinite(hdr.SLITW) ? hdr.SLITW : out.base_slitw;
-
-                // dbias
-                cm->dbias = hdr.DBIAS;
-
-                // detector on/off from DBIAS: missing => assume ON; else DBIAS>0 => ON
-                if(isfinite(cm->dbias)) cm->det_on = (cm->dbias > 0.0);
-                else cm->det_on = true;
             }
         }
 
@@ -551,6 +471,7 @@ static FileMeta scan_fits_file_multi(const char *path){
     }
     return out;
 }
+
 
 // ------------------------------
 // Vectors and grouping
@@ -627,33 +548,6 @@ static int find_found_bin(const BinVec *found, int binspat, int binspec){
 static int find_found_flat(const FlatVec *found, int binspat, int binspec, double slitw, double tol){
     for(int i=0;i<found->n;i++) if(found->v[i].binspat==binspat && found->v[i].binspec==binspec && fabs(found->v[i].slitw-slitw)<=tol) return i;
     return -1;
-}
-
-// ------------------------------
-// Night list
-// ------------------------------
-typedef struct { int night_id; int count; } NightCount;
-
-typedef struct { NightCount *v; int n, cap; } NightVec;
-
-static void nightvec_free(NightVec *a){ free(a->v); a->v=NULL; a->n=a->cap=0; }
-
-static void nightvec_add(NightVec *a, int night_id){
-    for(int i=0;i<a->n;i++) if(a->v[i].night_id==night_id){ a->v[i].count++; return; }
-    if(a->n==a->cap){
-        a->cap = a->cap? a->cap*2 : 16;
-        a->v = (NightCount*)realloc(a->v, (size_t)a->cap*sizeof(NightCount));
-        if(!a->v){ perror("realloc"); exit(2);}
-    }
-    a->v[a->n].night_id = night_id;
-    a->v[a->n].count = 1;
-    a->n++;
-}
-
-static int nightvec_pick_mode(const NightVec *a){
-    int best_id=0, best_c=0;
-    for(int i=0;i<a->n;i++) if(a->v[i].count > best_c){ best_c=a->v[i].count; best_id=a->v[i].night_id; }
-    return best_id;
 }
 
 // ------------------------------
@@ -805,23 +699,8 @@ static bool read_required_from_csv(const char *csvPath, BinVec *reqBins, FlatVec
 // ------------------------------
 // Directory scanning
 // ------------------------------
-static void scan_dir_collect_nights(const char *dirPath, NightVec *nights){
-    DIR *dp = opendir(dirPath);
-    if(!dp) return;
-    struct dirent *de;
-    while((de=readdir(dp))){
-        if(de->d_name[0]=='.') continue;
-        if(!is_fits_name(de->d_name)) continue;
-        char full[4096];
-        snprintf(full,sizeof(full),"%s/%s",dirPath,de->d_name);
-        FileMeta m = scan_fits_file_multi(full);
-        if(m.night_id>0) nightvec_add(nights, m.night_id);
-    }
-    closedir(dp);
-}
-
 typedef struct {
-    int ug_suppressed[2]; // [U,G] cal channel-frames skipped due to R/I not both OFF
+    int ug_suppressed[2]; // [U,G] cal channel-frames skipped because R and/or I extensions are present
 } SuppressStats;
 
 typedef struct {
@@ -830,7 +709,6 @@ typedef struct {
     // type idx:
     //  0 THAR, 1 FEAR, 2 BIAS, 3 DOMEFLAT, 4 DARK, 5 CONT, 6 SCI, 7 OTHER
     int ch_present[CH_N];
-    int ch_det_on[CH_N];
 } ScanStats;
 
 static int type_index(const char *imgtype){
@@ -846,7 +724,6 @@ static int type_index(const char *imgtype){
 
 static void scan_dir_counts(
     const char *dirPath,
-    int night_id_filter,
     BinVec *foundBins,
     FlatVec *foundFlats,
     BinVec *sciBins,
@@ -877,10 +754,10 @@ static void scan_dir_counts(
         if(!m.ok) continue;
         if(scanStats) scanStats->files_ok++;
 
-        if(night_id_filter>0 && m.night_id!=night_id_filter) continue;
         if(nFilesMatched) (*nFilesMatched)++;
 
-        bool ri_off = (m.ch[CH_R].present && !m.ch[CH_R].det_on) && (m.ch[CH_I].present && !m.ch[CH_I].det_on);
+        // For U/G calibration frames, require that R and I extensions are absent
+        bool ri_absent = (!m.ch[CH_R].present && !m.ch[CH_I].present);
 
         for(int ch=0; ch<CH_N; ch++){
             ChanMeta *cm = &m.ch[ch];
@@ -889,7 +766,6 @@ static void scan_dir_counts(
 
             if(scanStats){
                 scanStats->ch_present[ch]++;
-                if(cm->det_on) scanStats->ch_det_on[ch]++;
                 int ti = type_index(cm->imgtype);
                 if(ti>=0 && ti<8) scanStats->type_counts[ch][ti]++;
             }
@@ -897,7 +773,7 @@ static void scan_dir_counts(
             bool is_sci = is_sci_type(cm->imgtype);
             bool is_cal = is_cal_type(cm->imgtype);
 
-            // SCI handling: must be IMGTYPE=="SCI" (no DBIAS gating)
+            // SCI handling: must be IMGTYPE=="SCI"
             if(is_sci){
                 int bi = binvec_find_or_add(foundBins, cm->binspat, cm->binspec);
                 foundBins->v[bi].sci[ch]++;
@@ -910,15 +786,11 @@ static void scan_dir_counts(
             }
 
             // Ignore anything that's not SCI and not one of the allowed calibration IMGTYPEs
-            if(!is_cal){
-                continue;
-            }
+            if(!is_cal) continue;
 
-            // CAL handling: apply DBIAS gating and U/G R&I-off requirement
-            if(!cm->det_on) continue;
-
-            bool need_ri_off = false;
-            if(need_ri_off && !ri_off){
+            // U/G cal gating: require R and I extensions absent
+            bool need_ri_absent = (ch==CH_U || ch==CH_G);
+            if(need_ri_absent && !ri_absent){
                 if(supp){
                     if(ch==CH_U) supp->ug_suppressed[0]++;
                     if(ch==CH_G) supp->ug_suppressed[1]++;
@@ -949,16 +821,11 @@ static void scan_dir_counts(
     closedir(dp);
 }
 
+
 // ------------------------------
 // Rendering
 // ------------------------------
 static void clear_screen(void){ fputs("\033[2J\033[H", stdout); }
-
-static void print_count_cell(int have, int req, bool tty){
-    if(have >= req) printf("%s%2d/%-2d%s", tty?C_GREEN:"", have, req, tty?C_RESET:"");
-    else if(have > 0) printf("%s%2d/%-2d%s", tty?C_YELL:"", have, req, tty?C_RESET:"");
-    else printf("%s%2d/%-2d%s", tty?C_RED:"", have, req, tty?C_RESET:"");
-}
 
 // ------------------------------
 // Simple ASCII table printer (manual; no external deps)
@@ -1032,7 +899,6 @@ static void fmt_ch_col(char *buf, size_t n, const char *ch, bool ok, bool tty){
 
 static void render_dashboard(
     const char *dirPath,
-    int night_id,
     const char *csvPath,
     bool csv_ok,
     bool inferred_from_sci,
@@ -1053,7 +919,8 @@ static void render_dashboard(
 
     time_t now=time(NULL);
     struct tm lt; localtime_r(&now,&lt);
-    char tbuf[64]; strftime(tbuf,sizeof(tbuf),"%Y-%m-%d %H:%M:%S %Z",&lt);    printf("NGPS calibration status (multi-ext)  %s\n", tbuf);
+    char tbuf[64]; strftime(tbuf,sizeof(tbuf),"%Y-%m-%d %H:%M:%S %Z",&lt);
+    printf("NGPS calibration status (multi-ext)  %s\n", tbuf);
     printf("Directory: %s\n", dirPath);
     printf("Files scanned: %d, FITS ok: %d\n", nscan, nmatch);
     printf("Requirements per setup & per channel: THAR=%d FEAR=%d BIAS=%d DOMEFLAT=%d\n", REQ_THAR, REQ_FEAR, REQ_BIAS, REQ_DOMEFLAT);
@@ -1084,7 +951,7 @@ static void render_dashboard(
         printf("(no required binnings found)\n\n");
     } else {
         enum { NC_ARC = 8 };
-        const char *hdr[NC_ARC] = {"Binning","Ch","THAR","THAR<=2","FEAR","FEAR<=2","BIAS","SCI"};
+        const char *hdr[NC_ARC] = {"Binning","Ch","THAR","SLITW<=2","FEAR","SLITW<=2","BIAS","SCI"};
         bool right[NC_ARC]      = {false,false,true,true,true,true,true,true};
         int w[NC_ARC];
         for(int i=0;i<NC_ARC;i++) w[i]=(int)strlen(hdr[i]);
@@ -1244,7 +1111,6 @@ static void render_dashboard(
 typedef struct {
     const char *dirPath;
     const char *csvPath;
-    int night_id;
     int refresh_sec;
     bool once;
     double slit_tol;
@@ -1258,7 +1124,8 @@ typedef struct {
 static void usage(const char *argv0){
     printf("Usage: %s [options]\n\n", argv0);
     printf("Options:\n");
-    printf("  --dir PATH              Directory to scan (default: /data/latest)\n");    printf("  --csv FILE.csv           Observing plan CSV with BINSPAT,(BINSPEC|BINSPECT)[,SLITW|SLITWIDTH]\n");
+    printf("  --dir PATH              Directory to scan (default: /data/latest)\n");
+    printf("  --csv FILE.csv           Observing plan CSV with BINSPAT,(BINSPEC|BINSPECT)[,SLITW|SLITWIDTH]\n");
     printf("  --refresh N              Refresh every N seconds (default: 5)\n");
     printf("  --once                   Print once and exit\n");
     printf("  --slit-tol X             Slit match tolerance in arcsec (default: 0.05)\n");
@@ -1274,7 +1141,6 @@ static Options parse_args(int argc, char **argv){
     Options o={0};
     o.dirPath = "/data/latest";
     o.csvPath = NULL;
-    o.night_id = 0;
     o.refresh_sec = 5;
     o.once = false;
     o.slit_tol = 0.05;
@@ -1287,7 +1153,7 @@ static Options parse_args(int argc, char **argv){
     for(int i=1;i<argc;i++){
         const char *a=argv[i];
         if(strcmp(a,"--dir")==0 && i+1<argc){ o.dirPath=argv[++i]; continue; }
-        if(strcmp(a,"--csv")==0 && i+1<argc){ o.csvPath=argv[++i]; continue; }        if(strcmp(a,"")==0 && i+1<argc){ (void)argv[++i]; /* deprecated: ignored */ continue; }
+        if(strcmp(a,"--csv")==0 && i+1<argc){ o.csvPath=argv[++i]; continue; }
         if(strcmp(a,"--refresh")==0 && i+1<argc){ o.refresh_sec=atoi(argv[++i]); continue; }
         if(strcmp(a,"--once")==0){ o.once=true; continue; }
         if(strcmp(a,"--slit-tol")==0 && i+1<argc){ o.slit_tol=atof(argv[++i]); continue; }
@@ -1337,16 +1203,17 @@ static void debug_print_csv(const char *csvPath, const CsvStats *st){
 
 static void debug_print_scan(const ScanStats *ss){
     if(!ss) return;
-    fprintf(stderr,"[debug] Scan ok files: %d\n", ss->files_ok);
+    fprintf(stderr,"[debug] Scan summary: ok_files=%d\n", ss->files_ok);
     for(int ch=0; ch<CH_N; ch++){
-        fprintf(stderr,
-                "[debug]  %s: present=%d det_on=%d  types: THAR=%d FEAR=%d BIAS=%d DOMEFLAT=%d DARK=%d CONT=%d SCI=%d OTHER=%d\n",
-                CH_NAME[ch], ss->ch_present[ch], ss->ch_det_on[ch],
-                ss->type_counts[ch][0], ss->type_counts[ch][1], ss->type_counts[ch][2], ss->type_counts[ch][3],
-                ss->type_counts[ch][4], ss->type_counts[ch][5], ss->type_counts[ch][6], ss->type_counts[ch][7]);
+        fprintf(stderr,"[debug]   %s: present_ext=%d  THAR=%d FEAR=%d BIAS=%d "
+                       "DOMEFLAT=%d DARK=%d CONT=%d SCI=%d OTHER=%d\n",
+                CH_NAME[ch], ss->ch_present[ch],
+                ss->type_counts[ch][0], ss->type_counts[ch][1],
+                ss->type_counts[ch][2], ss->type_counts[ch][3],
+                ss->type_counts[ch][4], ss->type_counts[ch][5],
+                ss->type_counts[ch][6], ss->type_counts[ch][7]);
     }
 }
-
 
 static void debug_print_requirements(const BinVec *reqBins, const FlatVec *reqFlats, bool from_csv, bool inferred_from_sci, bool using_detected_fallback){
     fprintf(stderr,"[debug] Requirements source: %s%s%s\n",
@@ -1444,13 +1311,11 @@ static void html_ratio(FILE *out, int have, int req){
 static void compute_once_params(
     const char *dirPath,
     const char *csvPath,
-    int night_id_in,
     bool infer_from_sci_if_no_csv,
     double slit_tol,
     double default_slitw,
     bool debug,
     // outputs:
-    int *night_id_out,
     bool *csv_ok_out,
     bool *inferred_out,
     bool *fallback_out,
@@ -1463,10 +1328,6 @@ static void compute_once_params(
     SuppressStats *supp_out,
     CsvStats *csvStats_out
 ){
-    // night filtering disabled: consider all .fits in dir as relevant
-    int night_id = 0;
-    if(night_id_out) *night_id_out = 0;
-
     // CSV requirements
     bool csv_ok=false;
     CsvStats csvStats={0};
@@ -1488,7 +1349,7 @@ static void compute_once_params(
     SuppressStats supp={0};
     ScanStats scanStatsLocal={0};
 
-    scan_dir_counts(dirPath, night_id, foundBins, foundFlats, &sciBins, &sciFlats,
+    scan_dir_counts(dirPath, foundBins, foundFlats, &sciBins, &sciFlats,
                     slit_tol, &nscan, &nmatch, &supp, debug?&scanStatsLocal:NULL);
 
     if(nscan_out) *nscan_out = nscan;
@@ -1507,6 +1368,11 @@ static void compute_once_params(
             if(reqBins->n>0 || reqFlats->n>0) inferred=true;
         }
     }
+
+
+    // Always include any detected setups in the displayed setup list (e.g., if a new setup appears after startup)
+    for(int i=0;i<foundBins->n;i++) (void)binvec_find_or_add(reqBins, foundBins->v[i].binspat, foundBins->v[i].binspec);
+    for(int i=0;i<foundFlats->n;i++) (void)flatvec_find_or_add(reqFlats, foundFlats->v[i].binspat, foundFlats->v[i].binspec, foundFlats->v[i].slitw, slit_tol);
 
     if(reqBins->n==0 && reqFlats->n==0){
         for(int i=0;i<foundBins->n;i++) (void)binvec_find_or_add(reqBins, foundBins->v[i].binspat, foundBins->v[i].binspec);
@@ -1527,7 +1393,6 @@ static void compute_once_params(
 static void render_dashboard_html(
     FILE *out,
     const char *dirPath,
-    int night_id,
     const char *csvPath,
     bool csv_ok,
     bool inferred_from_sci,
@@ -1740,17 +1605,19 @@ static void handle_http_client(int cfd, const Options *opt){
     if(qmark){ *qmark=0; query = qmark+1; }
 
     // params with defaults
-    char dir[2048]={0}, csv[2048]={0}, refresh[32]={0};
-    snprintf(dir,sizeof(dir),"%s", opt->dirPath?opt->dirPath:"");
-    if(opt->csvPath) snprintf(csv,sizeof(csv),"%s", opt->csvPath);
+    char dir[2048]={0}, csv[2048]={0};
+    int refresh_sec = opt->refresh_sec;
+
+    // defaults from command-line
+    if(opt->dirPath) { size_t n=strlen(opt->dirPath); if(n>=sizeof(dir)) n=sizeof(dir)-1; memcpy(dir,opt->dirPath,n); dir[n]=0; }
+    if(opt->csvPath) { size_t n=strlen(opt->csvPath); if(n>=sizeof(csv)) n=sizeof(csv)-1; memcpy(csv,opt->csvPath,n); csv[n]=0; }
 
     if(query){
         char tmp[2048];
-        if(query_get_value(query,"dir",tmp,sizeof(tmp))) snprintf(dir,sizeof(dir),"%s", tmp);
-        if(query_get_value(query,"csv",tmp,sizeof(tmp))) snprintf(csv,sizeof(csv),"%s", tmp);
-        if(query_get_value(query,"refresh",tmp,sizeof(tmp))) snprintf(refresh,sizeof(refresh),"%s", tmp);
-    }    int night_id = 0; // night filtering disabled
-    int refresh_sec = (refresh[0] ? atoi(refresh) : opt->refresh_sec);
+        if(query_get_value(query,"dir",tmp,sizeof(tmp))) { size_t n=strlen(tmp); if(n>=sizeof(dir)) n=sizeof(dir)-1; memcpy(dir,tmp,n); dir[n]=0; }
+        if(query_get_value(query,"csv",tmp,sizeof(tmp))) { size_t n=strlen(tmp); if(n>=sizeof(csv)) n=sizeof(csv)-1; memcpy(csv,tmp,n); csv[n]=0; }
+        if(query_get_value(query,"refresh",tmp,sizeof(tmp))) refresh_sec = (int)strtol(tmp,NULL,10);
+    }
     if(refresh_sec < 0) refresh_sec = 0;
 
     const char *csvPath = (csv[0] ? csv : NULL);
@@ -1759,15 +1626,15 @@ static void handle_http_client(int cfd, const Options *opt){
     BinVec reqBins={0}, foundBins={0};
     FlatVec reqFlats={0}, foundFlats={0};
     bool csv_ok=false, inferred=false, fallback=false;
-    int night_used=0, nscan=0, nmatch=0;
+    int nscan=0, nmatch=0;
     SuppressStats supp={0};
     CsvStats csvStats={0};
 
-    compute_once_params(dir, csvPath, night_id,
+    compute_once_params(dir, csvPath,
                         opt->infer_from_sci_if_no_csv,
                         opt->slit_tol, opt->default_slitw,
                         opt->debug,
-                        &night_used, &csv_ok, &inferred, &fallback,
+                        &csv_ok, &inferred, &fallback,
                         &reqBins, &reqFlats, &foundBins, &foundFlats,
                         &nscan, &nmatch, &supp, &csvStats);
 
@@ -1776,7 +1643,7 @@ static void handle_http_client(int cfd, const Options *opt){
     if(out){
         setvbuf(out, NULL, _IONBF, 0);
         fprintf(out, "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nConnection: close\r\n\r\n");
-        render_dashboard_html(out, dir, night_used, csvPath, csv_ok, inferred, fallback,
+        render_dashboard_html(out, dir, csvPath, csv_ok, inferred, fallback,
                              &reqBins, &reqFlats, &foundBins, &foundFlats,
                              opt->slit_tol, nscan, nmatch, &supp, refresh_sec);
         fclose(out);
@@ -1825,10 +1692,7 @@ int main(int argc, char **argv){
         return run_gui_server(&opt);
     }
 
-    // Night filtering disabled: all .fits in the directory are considered part of the same observing set
-    opt.night_id = 0;
-
-    // Read requirements from CSV (if given)
+    // Night filtering disabled: all .fits in the directory are considered part of the same observing set    // Read requirements from CSV (if given)
     BinVec reqBins={0};
     FlatVec reqFlats={0};
     CsvStats csvStats={0};
@@ -1858,7 +1722,7 @@ int main(int argc, char **argv){
         SuppressStats supp={0};
         ScanStats scanStatsLocal={0};
 
-        scan_dir_counts(opt.dirPath, opt.night_id, &foundBins, &foundFlats, &sciBins, &sciFlats,
+        scan_dir_counts(opt.dirPath, &foundBins, &foundFlats, &sciBins, &sciFlats,
                         opt.slit_tol, &nscan, &nmatch, &supp, opt.debug?&scanStatsLocal:NULL);
 
         if(opt.debug && first_loop) debug_print_scan(&scanStatsLocal);
@@ -1882,6 +1746,10 @@ int main(int argc, char **argv){
             using_detected_fallback = (reqBins.n>0 || reqFlats.n>0);
         }
 
+        // Always include any newly-detected setups in the displayed setup list
+        for(int i=0;i<foundBins.n;i++) (void)binvec_find_or_add(&reqBins, foundBins.v[i].binspat, foundBins.v[i].binspec);
+        for(int i=0;i<foundFlats.n;i++) (void)flatvec_find_or_add(&reqFlats, foundFlats.v[i].binspat, foundFlats.v[i].binspec, foundFlats.v[i].slitw, opt.slit_tol);
+
         if(reqBins.n>1) qsort(reqBins.v,(size_t)reqBins.n,sizeof(BinGroup),cmp_bin_group);
         if(reqFlats.n>1) qsort(reqFlats.v,(size_t)reqFlats.n,sizeof(FlatGroup),cmp_flat_group);
 
@@ -1889,7 +1757,7 @@ int main(int argc, char **argv){
         if(opt.debug && first_loop){
             debug_print_requirements(&reqBins, &reqFlats, csv_ok, inferred_from_sci, using_detected_fallback);
         }
-render_dashboard(opt.dirPath, opt.night_id, opt.csvPath, csv_ok, inferred_from_sci, using_detected_fallback,
+render_dashboard(opt.dirPath, opt.csvPath, csv_ok, inferred_from_sci, using_detected_fallback,
                          &reqBins, &reqFlats, &foundBins, &foundFlats, opt.slit_tol, nscan, nmatch, &supp, do_clear);
 
         binvec_free(&foundBins); flatvec_free(&foundFlats);
