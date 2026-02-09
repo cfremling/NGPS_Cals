@@ -826,7 +826,7 @@ static void scan_dir_counts(
 // ------------------------------
 // Rendering
 // ------------------------------
-static void clear_screen(void){ fputs("\033[2J\033[H", stdout); }
+static void clear_screen(void){ fputs("\033[2J\033[3J\033[H", stdout); }
 
 // ------------------------------
 // Simple ASCII table printer (manual; no external deps)
@@ -1716,7 +1716,42 @@ int main(int argc, char **argv){
 
     bool first_loop=true;
 
+    // Track the date of last full reset for noon-reset logic.
+    // If the process is kept running across multiple nights, we perform
+    // a full state reset (re-read CSV, clear accumulated requirements)
+    // once noon (12:00 local) is reached on a new day.
+    time_t now_init = time(NULL);
+    struct tm lt_init; localtime_r(&now_init, &lt_init);
+    int last_reset_yday = lt_init.tm_yday;
+    int last_reset_year = lt_init.tm_year;
+
     while(1){
+        // Noon reset: if we've crossed into a new calendar day and it's past noon,
+        // clear all accumulated state and re-read CSV requirements.
+        {
+            time_t now_chk = time(NULL);
+            struct tm lt_chk; localtime_r(&now_chk, &lt_chk);
+            bool new_day = (lt_chk.tm_year != last_reset_year || lt_chk.tm_yday != last_reset_yday);
+            if(new_day && lt_chk.tm_hour >= 12){
+                fprintf(stderr,"[info] Noon reset: clearing accumulated state and re-reading requirements.\n");
+                binvec_free(&reqBins);
+                flatvec_free(&reqFlats);
+                memset(&reqBins, 0, sizeof(reqBins));
+                memset(&reqFlats, 0, sizeof(reqFlats));
+
+                csv_ok = false;
+                if(opt.csvPath){
+                    memset(&csvStats, 0, sizeof(csvStats));
+                    csv_ok = read_required_from_csv(opt.csvPath, &reqBins, &reqFlats, opt.default_slitw, opt.slit_tol, &csvStats);
+                    if(csv_ok && reqBins.n==0 && reqFlats.n==0) csv_ok=false;
+                    if(opt.debug) debug_print_csv(opt.csvPath, &csvStats);
+                }
+
+                last_reset_yday = lt_chk.tm_yday;
+                last_reset_year = lt_chk.tm_year;
+                first_loop = true;
+            }
+        }
         BinVec foundBins={0}, sciBins={0};
         FlatVec foundFlats={0}, sciFlats={0};
         int nscan=0, nmatch=0;
